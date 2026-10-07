@@ -1,0 +1,205 @@
+%% pitch_note_stability_demo.m
+%
+% Preliminary experiment for ELEC5305 project:
+% "From Pitch to Note: A Stability-Latency Trade-off Study for
+%  Real-Time Vocal Pitch Correction"
+%
+% This script:
+%   1. Generates a synthetic vocal-like test signal containing a
+%      sustained note with vibrato, followed by a semitone transition
+%      to a second sustained note with vibrato (a representative case
+%      per the project methodology).
+%   2. Estimates F0 using (a) a classical autocorrelation/YIN-style
+%      method via MATLAB's built-in pitch() function, and (b) CREPE
+%      via pitchnn() (falls back gracefully if the support package /
+%      Deep Learning Toolbox is not installed).
+%   3. Converts each F0 track to a framewise intended-note decision
+%      and a temporally stabilised intended-note decision (hysteresis
+%      + minimum-note-duration state machine).
+%   4. Plots everything and reports preliminary jitter/latency numbers.
+%
+% Requirements: Audio Toolbox. CREPE step additionally needs Deep
+% Learning Toolbox + the "Audio Toolbox Interface for pitchnn"
+% support package (installable via the Add-On Explorer).
+
+clear; clc; close all;
+
+%% 1. Generate synthetic test signal -------------------------------
+fs = 16000;
+noteA4  = 440;                 % Hz
+noteAs4 = noteA4 * 2^(1/12);   % A#4, one semitone up
+
+segDur   = 1.0;    % seconds per sustained note
+transDur = 0.15;   % seconds for the slide between notes
+vibRate  = 5;       % Hz, vibrato rate
+vibDepthCents = 40;  % vibrato depth in cents
+
+[sig1, t1, trueF0_1] = makeVibratoNote(noteA4,  segDur, vibRate, vibDepthCents, fs, 0);
+[sigT, tT, trueF0_T] = makeSlide(noteA4, noteAs4, transDur, fs, t1(end) + 1/fs);
+[sig2, t2, trueF0_2] = makeVibratoNote(noteAs4, segDur, vibRate, vibDepthCents, fs, tT(end) + 1/fs);
+
+audioIn = [sig1; sigT; sig2];
+t       = [t1;   tT;   t2];
+trueF0  = [trueF0_1; trueF0_T; trueF0_2];
+
+audioIn = audioIn / max(abs(audioIn)) * 0.9;   % normalise
+
+%% 2. Pitch estimation ----------------------------------------------
+frameLen = round(0.04 * fs);   % 40 ms analysis frame
+hopLen   = round(0.01 * fs);   % 10 ms hop
+
+% --- Classical (NCF = normalized correlation function, YIN-style) ---
+% NOTE: pitch() defaults to a ~50-400 Hz search range, which excludes
+% this test signal's true pitch (~440-480 Hz) and causes a systematic
+% octave-down error (the estimator locks onto the nearest subharmonic
+% it CAN see). Explicitly widen the range to cover the expected pitch.
+pitchRange = [80 1000];  % Hz; widen/narrow to match your actual voices
+[f0_classical, locClassical] = pitch(audioIn, fs, ...
+    'Method', 'NCF', 'Range', pitchRange, ...
+    'WindowLength', frameLen, 'OverlapLength', frameLen - hopLen);
+t_classical = locClassical / fs;
+
+% --- CREPE (deep learning), with graceful fallback ------------------
+haveCrepe = true;
+try
+    [f0_crepe, locCrepe] = pitchnn(audioIn, fs, ...
+        'WindowLength', frameLen, 'OverlapLength', frameLen - hopLen);
+    t_crepe = locCrepe / fs;
+catch ME
+    warning('CREPE (pitchnn) unavailable (%s). Install the "Audio Toolbox Interface for pitchnn" support package to enable it. Continuing with classical estimator only.', ME.message);
+    haveCrepe = false;
+    f0_crepe = f0_classical;  % placeholder so later code still runs
+    t_crepe  = t_classical;
+end
+
+%% 3. Framewise vs stabilised intended-note decisions ----------------
+midi_true       = hz2midi(interp1(t, trueF0, t_classical, 'nearest', 'extrap'));
+midi_classical  = hz2midi(f0_classical);
+midi_crepe      = hz2midi(f0_crepe);
+
+note_framewise_classical = round(midi_classical);
+note_framewise_crepe     = round(midi_crepe);
+
+minHoldSec = 0.06;  % minimum duration a candidate note must persist (60 ms)
+minHoldFrames = max(1, round(minHoldSec / (hopLen / fs)));
+
+note_stable_classical = stabiliseNotes(midi_classical, minHoldFrames);
+note_stable_crepe     = stabiliseNotes(midi_crepe, minHoldFrames);
+
+%% 4. Metrics ----------------------------------------------------------
+switches_fw_classical  = countSwitches(note_framewise_classical);
+switches_st_classical  = countSwitches(note_stable_classical);
+switches_fw_crepe      = countSwitches(note_framewise_crepe);
+switches_st_crepe      = countSwitches(note_stable_crepe);
+
+fprintf('--- Preliminary results ---\n');
+fprintf('Classical (NCF) pitch tracker:\n');
+fprintf('  Framewise note switches  : %d\n', switches_fw_classical);
+fprintf('  Stabilised note switches : %d  (minHold = %.0f ms)\n', switches_st_classical, minHoldSec*1000);
+if haveCrepe
+    fprintf('CREPE pitch tracker:\n');
+    fprintf('  Framewise note switches  : %d\n', switches_fw_crepe);
+    fprintf('  Stabilised note switches : %d  (minHold = %.0f ms)\n', switches_st_crepe, minHoldSec*1000);
+end
+fprintf('(True intended note changes in this test case: 1)\n');
+
+%% 5. Plots ------------------------------------------------------------
+figure('Name', 'F0 estimates', 'Color', 'w');
+plot(t, trueF0, 'k-', 'LineWidth', 1.5); hold on;
+plot(t_classical, f0_classical, 'b.-');
+if haveCrepe
+    plot(t_crepe, f0_crepe, 'r.-');
+    legend('Reference F0', 'Classical (NCF)', 'CREPE', 'Location', 'best');
+else
+    legend('Reference F0', 'Classical (NCF)', 'Location', 'best');
+end
+xlabel('Time (s)'); ylabel('Frequency (Hz)');
+title('Reference vs estimated F0 (vibrato + semitone transition)');
+grid on;
+
+figure('Name', 'Target-note decisions', 'Color', 'w');
+stairs(t_classical, note_framewise_classical, 'b--'); hold on;
+stairs(t_classical, note_stable_classical, 'b-', 'LineWidth', 1.5);
+stairs(t_classical, round(midi_true), 'k:', 'LineWidth', 1.5);
+legend('Framewise (classical)', 'Stabilised (classical)', 'True note', 'Location', 'best');
+xlabel('Time (s)'); ylabel('MIDI note number');
+title('Framewise vs. temporally stabilised intended-note decisions');
+grid on;
+
+%% ======================= Local functions ============================
+
+function [sig, t, f0] = makeVibratoNote(f0base, dur, vibRate, vibDepthCents, fs, t0)
+    % Synthesises a sustained harmonic tone with vibrato.
+    n = round(dur * fs);
+    t = t0 + (0:n-1)' / fs;
+    centsDev = vibDepthCents * sin(2*pi*vibRate*(t - t0));
+    f0 = f0base .* 2.^(centsDev/1200);
+    phase = 2*pi*cumsum(f0)/fs;
+    sig = zeros(n,1);
+    nHarm = 5;
+    for h = 1:nHarm
+        sig = sig + (1/h) * sin(h*phase);
+    end
+    sig = sig / max(abs(sig));
+end
+
+function [sig, t, f0] = makeSlide(fStart, fEnd, dur, fs, t0)
+    % Synthesises a portamento/slide between two frequencies.
+    n = round(dur * fs);
+    t = t0 + (0:n-1)' / fs;
+    f0 = linspace(fStart, fEnd, n)';
+    phase = 2*pi*cumsum(f0)/fs;
+    sig = zeros(n,1);
+    nHarm = 5;
+    for h = 1:nHarm
+        sig = sig + (1/h) * sin(h*phase);
+    end
+    sig = sig / max(abs(sig));
+end
+
+function midi = hz2midi(f0)
+    % Converts Hz to (fractional) MIDI note number. Unvoiced/zero frames
+    % are passed through as NaN so they don't corrupt note decisions.
+    midi = nan(size(f0));
+    voiced = f0 > 0;
+    midi(voiced) = 69 + 12*log2(f0(voiced)/440);
+end
+
+function stableNotes = stabiliseNotes(midiTrack, minHoldFrames)
+    % Minimum-duration / hysteresis state machine: a candidate note must
+    % persist for minHoldFrames consecutive frames before the target
+    % note is allowed to change.
+    N = numel(midiTrack);
+    stableNotes = nan(N,1);
+    candidate = round(midiTrack(1));
+    current   = candidate;
+    holdCount = 0;
+    for i = 1:N
+        if isnan(midiTrack(i))
+            stableNotes(i) = current;
+            continue;
+        end
+        cand_i = round(midiTrack(i));
+        if cand_i == current
+            holdCount = 0;
+        else
+            if cand_i == candidate
+                holdCount = holdCount + 1;
+            else
+                candidate = cand_i;
+                holdCount = 1;
+            end
+            if holdCount >= minHoldFrames
+                current = candidate;
+                holdCount = 0;
+            end
+        end
+        stableNotes(i) = current;
+    end
+end
+
+function nSwitches = countSwitches(noteSeq)
+    % Counts how many times the note sequence changes value.
+    d = diff(noteSeq(~isnan(noteSeq)));
+    nSwitches = sum(d ~= 0);
+end
